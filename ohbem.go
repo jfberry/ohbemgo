@@ -4,11 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/akyoto/cache"
 	"math"
 	"os"
 	"reflect"
-	"time"
 )
 
 const maxLevel = 100
@@ -21,15 +19,6 @@ func (o *Ohbem) FetchPokemonData() error {
 		return err
 	}
 	return nil
-}
-
-func (o *Ohbem) SetCache(ttl time.Duration, cleaningInterval time.Duration) {
-	// Some might want to disable cache which is disabled by default. Zero would panic hence check.
-	if cleaningInterval == 0 {
-		return
-	}
-	o.Cache = cache.New(cleaningInterval * time.Minute)
-	o.CacheTTL = ttl * time.Minute
 }
 
 func (o *Ohbem) LoadPokemonData(filePath string) error {
@@ -54,14 +43,65 @@ func (o *Ohbem) SavePokemonData(filePath string) error {
 	return nil
 }
 
-func (o *Ohbem) CalculateAllRanks(stats PokemonStats, cpCap int) (result [101][16][16][16]Ranking, filled bool) {
+type CompactCacheValue struct {
+	Combinations [4096]int16
+	TopValue     float64
+}
+
+func (o *Ohbem) CalculateAllRanksCompact(stats PokemonStats, cpCap int) (map[int]CompactCacheValue, bool) {
 	cacheKey := fmt.Sprintf("%d,%d,%d,%d", stats.Attack, stats.Defense, stats.Stamina, cpCap)
-	if o.Cache != nil {
-		obj, found := o.Cache.Get(cacheKey)
-		if found {
-			return obj.([101][16][16][16]Ranking), true
+
+	obj, found := o.compactRankCache.Load(cacheKey)
+	if found {
+		return obj.(map[int]CompactCacheValue), true
+	}
+
+	result := make(map[int]CompactCacheValue)
+	filled := false
+
+	maxed := false
+
+	for _, lvCap := range o.LevelCaps {
+		if calculateCp(stats, 15, 15, 15, lvCap) <= int(lvCap) { // not viable [should be optional]
+			continue
+		}
+
+		combinations, sortedRanks := calculateRanksCompact(stats, cpCap, lvCap, 1)
+		res := CompactCacheValue{
+			Combinations: combinations,
+			TopValue:     sortedRanks[0].Value,
+		}
+		result[int(lvCap)] = res
+		filled = true
+		if calculateCp(stats, 0, 0, 0, float64(lvCap)+0.5) > cpCap {
+			maxed = true
+			break
 		}
 	}
+	if filled && !maxed {
+		combinations, sortedRanks := calculateRanksCompact(stats, cpCap, maxLevel, 1)
+
+		res := CompactCacheValue{
+			Combinations: combinations,
+			TopValue:     sortedRanks[0].Value,
+		}
+		result[maxLevel] = res
+	}
+	if filled {
+		o.compactRankCache.Store(cacheKey, result)
+	}
+	return result, filled
+}
+
+// Retain with no caching
+func (o *Ohbem) CalculateAllRanks(stats PokemonStats, cpCap int) (result [101][16][16][16]Ranking, filled bool) {
+	//cacheKey := fmt.Sprintf("%d,%d,%d,%d", stats.Attack, stats.Defense, stats.Stamina, cpCap)
+	//if o.Cache != nil {
+	//	obj, found := o.Cache.Get(cacheKey)
+	//	if found {
+	//		return obj.([101][16][16][16]Ranking), true
+	//	}
+	//}
 
 	//calculator := func(lvCap float64) [16][16][16]Ranking {
 	//	if o.Cache != nil {
@@ -88,9 +128,9 @@ func (o *Ohbem) CalculateAllRanks(stats PokemonStats, cpCap int) (result [101][1
 			result[maxLevel], _ = calculateRanks(stats, cpCap, float64(maxLevel))
 		}
 	}
-	if o.Cache != nil {
-		o.Cache.Set(cacheKey, result, o.CacheTTL)
-	}
+	//if o.Cache != nil {
+	//	o.Cache.Set(cacheKey, result, o.CacheTTL)
+	//}
 	return result, filled
 }
 
@@ -229,6 +269,7 @@ func (o *Ohbem) CalculateTopRanks(maxRank int16, pokemonId int, form int, evolut
 	return result
 }
 
+// Always use cached compact ranks
 func (o *Ohbem) QueryPvPRank(pokemonId int, form int, costume int, gender int, attack int, defense int, stamina int, level float64) (map[string][]PokemonEntry, error) {
 	result := make(map[string][]PokemonEntry)
 
@@ -271,24 +312,27 @@ func (o *Ohbem) QueryPvPRank(pokemonId int, form int, costume int, gender int, a
 			if leagueOptions.Little && !(masterForm.Little || masterPokemon.Little) {
 				continue
 			}
-			combinationIndex, filled := o.CalculateAllRanks(stats, leagueOptions.Cap)
+			combinationIndex, filled := o.CalculateAllRanksCompact(stats, leagueOptions.Cap)
 			if !filled {
 				continue
 			}
 			for lvCap, combinations := range combinationIndex {
-				var entry PokemonEntry
-				var ivEntry = combinations[attack][defense][stamina]
-				if level > ivEntry.Level {
+
+				pcap := float64(lvCap)
+				stat, err := calculatePvPStat(stats, attack, defense, stamina, leagueOptions.Cap, pcap, level)
+				if err != nil {
 					continue
 				}
-				entry = baseEntry
-				entry.Cap = float64(lvCap)
-				entry.Value = ivEntry.Value
-				entry.Level = ivEntry.Level
-				entry.Cp = ivEntry.Cp
-				entry.Percentage = ivEntry.Percentage
-				entry.Rank = ivEntry.Rank
-				entry.Capped = ivEntry.Capped
+				entry := PokemonEntry{
+					Pokemon:    baseEntry.Pokemon,
+					Form:       baseEntry.Form,
+					Cap:        pcap,
+					Value:      stat.Value,
+					Level:      stat.Level,
+					Cp:         stat.Cp,
+					Percentage: stat.Value / combinations.TopValue, //fmt.Sprintf("%.5f", stat.Value / combinations.TopValue),
+					Rank:       combinations.Combinations[(attack*16+defense)*16+stamina],
+				}
 
 				if evolution != 0 {
 					entry.Evolution = evolution
