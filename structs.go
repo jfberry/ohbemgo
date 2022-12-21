@@ -86,5 +86,4 @@ type Ohbem struct {
 	LevelCaps        []float64
 	Leagues          Leagues
 	compactRankCache sync.Map
-	compactCache     sync.Map
 }
